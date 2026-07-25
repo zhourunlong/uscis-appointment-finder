@@ -1,9 +1,13 @@
-# python main.py (--dry-run)
+# python main.py            -> direct lookup (1 request, instant)
+# python main.py --scan     -> parallel brute-force fallback
+# python main.py --dry-run  -> single verbose request
 
 import argparse
 import json
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -185,8 +189,16 @@ ASC_CODES = [
     "XWC",  # USCIS WATFORD CITY
 ]
 
-# Delay between requests, don't change
-DELAY_BETWEEN_REQUESTS = 0.5  
+# --- Scan tuning (only used by --scan; the default path sends ONE request) ---
+# Concurrent in-flight requests. Measured: 40 concurrent completed in ~1.0s with
+# zero throttling, so 16 is comfortably conservative. Raise cautiously — the site
+# sits behind Akamai Bot Manager (ak_bmsc/bm_sv) and Cloudflare (__cf_bm), which
+# block on burst *patterns* rather than a published rate limit.
+MAX_WORKERS = 16
+
+# Per-worker pause between requests. 0 is fine at MAX_WORKERS=16; increase if you
+# start seeing 403s.
+DELAY_BETWEEN_REQUESTS = 0.0
 
 # ---------------------------------------------------------------------------
 # Paths & URLs
@@ -278,6 +290,26 @@ def post_find_appointment(session: requests.Session, csrf: str,
     return session.post(API_URL, json=body, headers=api_headers(csrf), timeout=15)
 
 
+def post_direct_lookup(session: requests.Session, csrf: str) -> requests.Response:
+    """
+    Ask the API for this receipt's appointment WITHOUT guessing date/time/asc.
+
+    The endpoint does an exact match on whatever appointment fields you send: pass a
+    wrong date, time, or asc and searchResults comes back empty, which is why the
+    brute-force scan had to hit the precise triple. Omit those fields entirely and the
+    server has nothing to filter on, so it returns the appointment directly.
+
+    Note: appointmentTime must be omitted rather than sent empty — sending it alone
+    returns HTTP 500.
+    """
+    body = {"appointment": {"receiptNumber": RECEIPT_NUMBER}}
+    if ALIEN_NUMBER:
+        body["appointment"]["alienNumber"] = ALIEN_NUMBER
+    if DATE_OF_BIRTH:
+        body["appointment"]["dateOfBirth"] = DATE_OF_BIRTH
+    return session.post(API_URL, json=body, headers=api_headers(csrf), timeout=20)
+
+
 def date_range(start: str, end: str):
     current = datetime.strptime(start, "%Y-%m-%d")
     last = datetime.strptime(end, "%Y-%m-%d")
@@ -285,6 +317,89 @@ def date_range(start: str, end: str):
         if current.weekday() < 5:  # Mon-Fri only
             yield current.strftime("%Y-%m-%d")
         current += timedelta(days=1)
+
+
+# ---------------------------------------------------------------------------
+# Direct lookup mode (default)
+# ---------------------------------------------------------------------------
+
+def format_appointment(appt: dict) -> str:
+    """Pretty-print one searchResults entry."""
+    lines = []
+    raw_dt = appt.get("appointmentDateTime")
+    if raw_dt:
+        try:
+            dt = datetime.strptime(raw_dt, "%Y-%m-%dT%H:%M:%S")
+            lines.append(f"    When     : {dt.strftime('%A, %B %d, %Y at %-I:%M %p')}")
+        except ValueError:
+            lines.append(f"    When     : {raw_dt}")
+
+    center = appt.get("assignedServiceCenter") or {}
+    if center:
+        lines.append(f"    Where    : {center.get('description', '?')} "
+                     f"({center.get('code', '?')})")
+        addr = center.get("address") or {}
+        if addr:
+            street = " ".join(x for x in (addr.get("street1"), addr.get("street2")) if x)
+            lines.append(f"    Address  : {street}")
+            lines.append(f"               {addr.get('city', '')}, "
+                         f"{addr.get('state', '')} {addr.get('zipcode', '')}")
+
+    lines.append(f"    Form     : {appt.get('formType', '?')}")
+    lines.append(f"    Receipt  : {appt.get('receiptNumber', '?')}")
+    lines.append(f"    Status   : {appt.get('status', '?')}")
+    lines.append(f"    Created  : {appt.get('createdDateTime', '?')}")
+    lines.append(f"    Reschedulable: {appt.get('canReschedule')} "
+                 f"(rescheduled {appt.get('rescheduleCount', 0)}x)")
+    return "\n".join(lines)
+
+
+def run_direct(session: requests.Session, csrf: str) -> bool:
+    """Single-request lookup. Returns True if an appointment was found."""
+    print("\n" + "=" * 65)
+    print("  DIRECT LOOKUP — 1 request")
+    print("=" * 65)
+    print(f"  Receipt : {RECEIPT_NUMBER}")
+
+    r = post_direct_lookup(session, csrf)
+
+    bad_tag = classify_response(r.status_code, r.text)
+    if bad_tag:
+        if bad_tag == RESP_CAPTCHA:
+            print("\n  ** CAPTCHA / session expired — re-export your cookies. **")
+        else:
+            print("\n  ** 403 Access Denied — blocked by WAF. **")
+        return False
+
+    if r.status_code != 200:
+        print(f"\n  HTTP {r.status_code}: {r.text[:400]}")
+        return False
+
+    try:
+        data = r.json()
+    except ValueError:
+        print(f"\n  Non-JSON response: {r.text[:400]}")
+        return False
+
+    results = (data.get("data") or {}).get("searchResults") or []
+
+    with open(OUTPUT_PATH, "w") as f:
+        json.dump({"mode": "direct", "fetched_at": datetime.now().isoformat(),
+                   "response": data}, f, indent=2)
+
+    if not results:
+        print("\n  No appointment found yet.")
+        print("  USCIS has not created your biometrics appointment. Try again later.")
+        print(f"\n  Saved to {OUTPUT_PATH}")
+        return False
+
+    print(f"\n  FOUND {len(results)} appointment(s):\n")
+    for appt in results:
+        print(format_appointment(appt))
+        print()
+
+    print(f"  Saved to {OUTPUT_PATH}")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +539,8 @@ def run_enumerate(session: requests.Session, csrf: str):
     print(f"  ASC     : {', '.join(ASC_CODES)}")
     print(f"  Range   : {SCAN_START} → {SCAN_END}")
     print(f"  Slots   : {len(TIME_SLOTS)} per day")
-    print(f"  Delay   : {DELAY_BETWEEN_REQUESTS}s between requests\n")
+    print(f"  Workers : {MAX_WORKERS} concurrent")
+    print(f"  Delay   : {DELAY_BETWEEN_REQUESTS}s per worker\n")
 
     # Load previous results for resume
     response_groups, already_queried = load_previous_results()
@@ -438,64 +554,101 @@ def run_enumerate(session: requests.Session, csrf: str):
     print(f"  Total combinations : {total}")
     print(f"  Already completed  : {len(already_queried)}")
     print(f"  Remaining          : {remaining}")
-    print(f"  Estimated time     : ~{remaining * DELAY_BETWEEN_REQUESTS / 60:.0f} min\n")
+    # ~40 req/s measured at 16 workers; keep the estimate deliberately pessimistic.
+    est_rate = MAX_WORKERS / max(DELAY_BETWEEN_REQUESTS, 0.05)
+    print(f"  Estimated time     : ~{remaining / est_rate / 60:.0f} min\n")
 
     errors = []
     count = len(already_queried)
     skipped = len(already_queried)
     prev_summary_lines = 0
 
-    for date in dates:
-        for ts in TIME_SLOTS:
-            for asc in ASC_CODES:
-                query_label = f"{asc} {date} {ts}"
+    pending = [
+        (date, ts, asc)
+        for date in dates
+        for ts in TIME_SLOTS
+        for asc in ASC_CODES
+        if f"{asc} {date} {ts}" not in already_queried
+    ]
 
-                if query_label in already_queried:
+    # Guards shared across worker threads.
+    lock = threading.Lock()
+    abort = threading.Event()
+    abort_tag: list[str] = []
+
+    def worker(job: tuple[str, str, str]):
+        """Run one query. Returns (label, status, body) or None if aborted/errored."""
+        date, ts, asc = job
+        if abort.is_set():
+            return None
+        label = f"{asc} {date} {ts}"
+        try:
+            r = post_find_appointment(session, csrf, date, ts, asc)
+        except requests.RequestException as e:
+            with lock:
+                errors.append({"query": label, "error": str(e)})
+            return None
+        if DELAY_BETWEEN_REQUESTS:
+            time.sleep(DELAY_BETWEEN_REQUESTS)
+        return label, r.status_code, r.text
+
+    # requests.Session is documented as not thread-safe, but the risky part is
+    # mutating shared state (cookies/headers) mid-flight. Here every worker only
+    # issues reads against an already-populated session, and urllib3's connection
+    # pool is itself thread-safe, so concurrent posts are fine.
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futures = {pool.submit(worker, job): job for job in pending}
+        try:
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is None:
+                    continue
+                label, status, body_text = result
+
+                bad_tag = classify_response(status, body_text)
+                if bad_tag:
+                    # Stop issuing new work; in-flight requests still drain.
+                    if not abort.is_set():
+                        abort.set()
+                        abort_tag.append(bad_tag)
+                        for f in futures:
+                            f.cancel()
                     continue
 
                 count += 1
-
-                try:
-                    r = post_find_appointment(session, csrf, date, ts, asc)
-                except requests.RequestException as e:
-                    print(f"\n  [{count}/{total}] {query_label} — ERROR: {e}")
-                    errors.append({"query": query_label, "error": str(e)})
-                    time.sleep(DELAY_BETWEEN_REQUESTS)
-                    continue
-
-                body_text = r.text
-                status = r.status_code
-
-                # Check for CAPTCHA or 403
-                bad_tag = classify_response(status, body_text)
-                if bad_tag:
-                    save_results(response_groups, count, errors)
-                    print(f"\n\n  [{count}/{total}] {query_label}")
-                    if bad_tag == RESP_CAPTCHA:
-                        print("  ** CAPTCHA / session expired detected! **")
-                        print("  The server returned a login/CAPTCHA page.")
-                    else:
-                        print("  ** 403 Access Denied — blocked by WAF! **")
-                    print(f"\n  Progress saved ({count - skipped} new queries this run).")
-                    print("  To resume:")
-                    print("    1. Re-export your cookies from Chrome")
-                    print("    2. Run the script again — it will skip already-completed queries")
-                    return
-
                 resp_key = body_text if status == 200 else f"HTTP {status}: {body_text}"
-                response_groups.setdefault(resp_key, []).append(query_label)
+                response_groups.setdefault(resp_key, []).append(label)
 
-                if prev_summary_lines > 0:
-                    sys.stdout.write(f"\033[{prev_summary_lines}A\033[J")
+                # Redraw only occasionally — at 16 workers a redraw per response
+                # would dominate the runtime.
+                if count % 25 == 0 or count == total:
+                    if prev_summary_lines > 0:
+                        sys.stdout.write(f"\033[{prev_summary_lines}A\033[J")
+                    sys.stdout.write(f"  [{count}/{total}] {label} — HTTP {status}")
+                    print_response_summary(response_groups)
+                    prev_summary_lines = len(response_groups) + 4
+                    save_results(response_groups, count, errors)
+        except KeyboardInterrupt:
+            abort.set()
+            for f in futures:
+                f.cancel()
+            print("\n\n  Interrupted — saving progress ...")
 
-                sys.stdout.write(f"  [{count}/{total}] {query_label} — HTTP {status}")
-                print_response_summary(response_groups)
+    save_results(response_groups, count, errors)
 
-                prev_summary_lines = len(response_groups) + 4
-
-                save_results(response_groups, count, errors)
-
-                time.sleep(DELAY_BETWEEN_REQUESTS)
+    if abort_tag:
+        print(f"\n\n  Stopped after {count - skipped} new queries this run.")
+        if abort_tag[0] == RESP_CAPTCHA:
+            print("  ** CAPTCHA / session expired detected! **")
+            print("  The server returned a login/CAPTCHA page.")
+        else:
+            print("  ** 403 Access Denied — blocked by WAF! **")
+        print("\n  Progress saved. To resume:")
+        print("    1. Re-export your cookies from Chrome")
+        print("    2. Run the script again — it will skip already-completed queries")
+        print(f"    3. Consider lowering MAX_WORKERS (currently {MAX_WORKERS}) "
+              "or raising DELAY_BETWEEN_REQUESTS")
+        return
 
     # Final summary
     print("\n\n" + "=" * 65)
@@ -521,6 +674,10 @@ def main():
     parser = argparse.ArgumentParser(description="USCIS Biometrics Appointment Finder")
     parser.add_argument("--dry-run", action="store_true",
                         help="Single request with hardcoded date/time, print everything")
+    parser.add_argument("--scan", action="store_true",
+                        help="Brute-force every date/time/ASC combination in parallel. "
+                             "Rarely needed — the default direct lookup returns the "
+                             "appointment in one request.")
     args = parser.parse_args()
 
     print("=" * 65)
@@ -542,8 +699,10 @@ def main():
 
     if args.dry_run:
         run_dry(session, csrf)
-    else:
+    elif args.scan:
         run_enumerate(session, csrf)
+    else:
+        run_direct(session, csrf)
 
     print("\n" + "=" * 65)
     print("  Done.")

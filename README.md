@@ -48,12 +48,23 @@ SCAN_START = "2026-03-13"          # start of date range to search
 SCAN_END   = "2026-06-30"          # end of date range to search
 ```
 
-Trim `ASC_CODES` to only include locations near your mailing address — 3 or so is sufficient and dramatically reduces search time.
+`SCAN_START`, `SCAN_END`, and `ASC_CODES` only affect the optional `--scan` fallback. The
+default lookup ignores them, so you do not need to configure them.
 
 ### Step 4 — Run the script
 
 ```bash
 python main.py
+```
+
+That's it — one request, and your appointment prints immediately:
+
+```
+    When     : Thursday, June 11, 2026 at 10:00 AM
+    Where    : USCIS EXAMPLE CITY (XYZ)
+    Address  : 123 Example Street Suite 100
+               Example City, ST 00000
+    Status   : SCHEDULED
 ```
 
 Use `--dry-run` to fire a single test request and verify your cookies are working:
@@ -64,11 +75,42 @@ python main.py --dry-run
 
 ## How it works
 
-The script iterates over every combination of date, time slot, and ASC location within your configured range, querying the USCIS appointment API for each. Results are grouped by response body, so when your appointment exists you will see a distinct response containing your details.
+The `find-appointment` endpoint does an **exact match** on whatever appointment fields you
+send it. Pass a date, time, or ASC code that doesn't match your real appointment and
+`searchResults` comes back empty — which is why searching for it meant guessing the precise
+date + time + location triple.
 
-Progress is saved to `uscis_appointment_results.json` after every request, so the script can resume where it left off if interrupted. If your session expires (CAPTCHA or 403), re-export your cookies and run again — already-completed queries are skipped automatically.
+Omit those three fields entirely and the server has nothing to filter on, so it returns
+your appointment directly. Authentication is by session cookie, so the endpoint already
+knows which account is asking. One request replaces what was previously a scan of every
+combination in the range (152,190 requests at the default settings).
 
-> **Tip:** If your appointment hasn't actually been created yet, delete `uscis_appointment_results.json` daily so stale "not found" results don't mask a newly created appointment.
+## The `--scan` fallback
+
+The original brute-force scan is still available and now runs in parallel:
+
+```bash
+python main.py --scan
+```
+
+Measured at ~57 requests/second with `MAX_WORKERS = 16`, versus ~2/second sequentially.
+Progress is saved to `uscis_appointment_results.json` and interrupted runs resume
+automatically, skipping already-completed queries.
+
+You should not normally need this — it exists in case USCIS changes the endpoint so that
+omitting the fields stops working.
+
+### Rate limits
+
+There is no published rate limit, and 40 concurrent requests completed in ~1.0s with zero
+throttling during testing. The site does sit behind Akamai Bot Manager (`ak_bmsc`, `bm_sv`)
+and Cloudflare (`__cf_bm`), which act on burst *patterns* rather than a fixed threshold, so
+`MAX_WORKERS = 16` is deliberately conservative. If you start seeing 403s, lower
+`MAX_WORKERS` or raise `DELAY_BETWEEN_REQUESTS`.
+
+> **Tip:** If your appointment hasn't been created yet, the lookup reports "No appointment
+> found yet" — just run it again later. Unlike the old scan, there are no stale cached
+> "not found" results to clear.
 
 ## Reading the results
 
